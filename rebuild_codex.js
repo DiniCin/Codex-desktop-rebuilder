@@ -12,18 +12,46 @@ const FINAL_APP_PATH = path.join(REPO_ROOT, 'Codex_Intel.app');
 const RESOURCES_DIR = path.join(REPO_ROOT, 'resources');
 // detect CODEX_CLI_PATH dynamically
 let CODEX_CLI_PATH = '/usr/local/lib/node_modules/@openai/codex';
+let codexPathFound = false;
 
+// Attempt 1: ask npm directly
 try {
     const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
     const possiblePath = path.join(globalRoot, '@openai/codex');
     if (fs.existsSync(possiblePath)) {
         CODEX_CLI_PATH = possiblePath;
+        codexPathFound = true;
         console.log(`Detected Codex CLI at: ${CODEX_CLI_PATH}`);
-    } else {
-        console.log(`Could not find @openai/codex at ${possiblePath}, using default: ${CODEX_CLI_PATH}`);
     }
 } catch (e) {
-    console.warn("Could not auto-detect npm root. Using default path.");
+    // fall through to attempt 2
+}
+
+// Attempt 2: scan nvm's installed node versions directly, since `npm root -g`
+// run via execSync's subshell doesn't always inherit nvm's PATH the same way
+// an interactive shell does.
+if (!codexPathFound) {
+    try {
+        const nvmDir = path.join(os.homedir(), '.nvm', 'versions', 'node');
+        if (fs.existsSync(nvmDir)) {
+            const versions = fs.readdirSync(nvmDir);
+            for (const v of versions) {
+                const candidate = path.join(nvmDir, v, 'lib', 'node_modules', '@openai', 'codex');
+                if (fs.existsSync(candidate)) {
+                    CODEX_CLI_PATH = candidate;
+                    codexPathFound = true;
+                    console.log(`Detected Codex CLI via nvm scan at: ${CODEX_CLI_PATH}`);
+                    break;
+                }
+            }
+        }
+    } catch (e) {
+        // fall through
+    }
+}
+
+if (!codexPathFound) {
+    console.log(`Could not find @openai/codex via npm root -g or nvm scan. Using default: ${CODEX_CLI_PATH}`);
 }
 
 // Helper for executing commands
@@ -167,6 +195,42 @@ async function main() {
 
     // Clean version (remove ^ or ~)
     electronVersion = electronVersion.replace(/^[\^~]/, '');
+    console.log(`App expects Electron Version: ${electronVersion}`);
+
+    // Electron 38+ requires macOS 12 (Monterey) or later to even launch
+    // (dyld will fail loading frameworks on older macOS). Allow override via
+    // --electron-version=X.Y.Z flag or ELECTRON_VERSION_OVERRIDE env var;
+    // otherwise auto-downgrade if running on macOS < 12 and the detected
+    // version is 38+.
+    const versionFlag = process.argv.find(a => a.startsWith('--electron-version='));
+    const explicitOverride = versionFlag ? versionFlag.split('=')[1] : process.env.ELECTRON_VERSION_OVERRIDE;
+
+    const FALLBACK_ELECTRON_FOR_OLDER_MACOS = '37.5.1'; // last major line supporting macOS 11 (Big Sur)
+
+    if (explicitOverride) {
+        console.log(`Using explicitly requested Electron version override: ${explicitOverride}`);
+        electronVersion = explicitOverride;
+    } else {
+        const electronMajor = parseInt(electronVersion.split('.')[0], 10);
+        let macOsMajor = null;
+        let swVers = null;
+        try {
+            swVers = execSync('sw_vers -productVersion', { encoding: 'utf8' }).trim();
+            macOsMajor = parseInt(swVers.split('.')[0], 10);
+        } catch (e) {
+            console.warn("Could not detect macOS version via sw_vers; skipping compatibility check.");
+        }
+
+        if (macOsMajor !== null && macOsMajor < 12 && electronMajor >= 38) {
+            console.warn(`WARNING: Electron ${electronVersion} requires macOS 12 (Monterey) or later.`);
+            console.warn(`You're running macOS ${swVers} (Big Sur or earlier). The app would fail to launch (dyld errors) if built against Electron ${electronVersion}.`);
+            console.warn(`Falling back to Electron ${FALLBACK_ELECTRON_FOR_OLDER_MACOS}, the last release line confirmed to run on macOS 11.`);
+            console.warn(`NOTE: The Codex app's bundled code was built for Electron ${electronVersion} and may rely on newer Electron APIs. Test thoroughly after rebuild.`);
+            console.warn(`To force a specific version instead, rerun with --electron-version=X.Y.Z`);
+            electronVersion = FALLBACK_ELECTRON_FOR_OLDER_MACOS;
+        }
+    }
+
     console.log(`Target Electron Version: ${electronVersion}`);
 
     // 3. Download Electron x64
@@ -406,7 +470,7 @@ exec "$DIR/Codex.orig" --no-sandbox "$@"
         }
 
     } else {
-        console.warn(`WARNING: Could not find local x64 Codex binary. Checked: ${potentialCodexPaths.join(', ')}`);
+        console.warn(`WARNING: Could not find local x64 Codex binary. Checked under: ${CODEX_CLI_PATH}`);
     }
 
     // 8. Fix Timestamps

@@ -392,6 +392,28 @@ async function main() {
 
     if (fs.existsSync(localInfoPlist)) {
         fs.copyFileSync(localInfoPlist, infoPlistDest);
+
+        // The copied Info.plist came from the ORIGINAL app (built for
+        // electronVersion as declared in package.json), so its
+        // LSMinimumSystemVersion reflects that original version's OS
+        // requirement -- even if we've since substituted an older,
+        // more-compatible Electron binary above. Patch it to match
+        // whatever Electron version we actually bundled.
+        const finalElectronMajor = parseInt(electronVersion.split('.')[0], 10);
+        let requiredMacOSVersion;
+        if (finalElectronMajor >= 38) {
+            requiredMacOSVersion = '12.0';
+        } else if (finalElectronMajor >= 33) {
+            requiredMacOSVersion = '11.0';
+        } else {
+            requiredMacOSVersion = '10.15';
+        }
+        try {
+            execSync(`plutil -replace LSMinimumSystemVersion -string "${requiredMacOSVersion}" "${infoPlistDest}"`, { stdio: 'inherit' });
+            console.log(`Set LSMinimumSystemVersion to ${requiredMacOSVersion} (matching bundled Electron ${electronVersion}).`);
+        } catch (e) {
+            console.warn("Could not patch LSMinimumSystemVersion:", e.message);
+        }
     }
 
     const macOsDir = path.join(targetApp, 'Contents/MacOS');
@@ -489,7 +511,23 @@ exec "$DIR/Codex.orig" --no-sandbox "$@"
         console.warn("SetFile failed or not available (this is normal on non-macOS or minimal envs). Creation date might be old.");
     }
 
-    // 9. Cleanup temp files
+    // 9. Clear quarantine and ad-hoc sign so Finder/LaunchServices will
+    // actually launch this assembled app (mixed sources -- extracted DMG
+    // content + freshly downloaded Electron -- commonly fail Finder's
+    // launch checks even when the binary itself is fine).
+    console.log("Clearing quarantine attribute and ad-hoc signing...");
+    try {
+        execSync(`xattr -cr "${targetApp}"`, { stdio: 'inherit' });
+    } catch (e) {
+        console.warn("Failed to clear quarantine attribute:", e.message);
+    }
+    try {
+        execSync(`codesign --force --deep --sign - "${targetApp}"`, { stdio: 'inherit' });
+    } catch (e) {
+        console.warn("Ad-hoc code signing failed:", e.message);
+    }
+
+    // 10. Cleanup temp files
     console.log("Cleaning up temporary files...");
     for (const dir of [TEMP_DIR, tempBuildDir]) {
         if (fs.existsSync(dir)) {

@@ -255,16 +255,47 @@ async function main() {
         npm_config_target_arch: 'x64',
         npm_config_dist_url: 'https://electronjs.org/headers',
         npm_config_runtime: 'electron',
-        npm_config_build_from_source: 'true',
-        // Force C++20 for Electron 40 compatibility (fixes source_location error)
-        CXXFLAGS: '-std=c++20 -stdlib=libc++'
     };
 
-    console.log("Running npm install with electron environment...");
+    console.log("Installing native module sources (scripts disabled)...");
     try {
-        execSync(`npm install --no-bin-links --force`, { cwd: tempBuildDir, env, stdio: 'inherit' });
+        execSync(`npm install --ignore-scripts`, { cwd: tempBuildDir, env, stdio: 'inherit' });
     } catch (e) {
-        console.error("Build failed, continuing carefully...");
+        console.error("npm install failed:", e.message);
+    }
+
+    // Try prebuilt binaries first for each native module; only fall back to
+    // node-gyp (source compile) if no prebuild exists for this Electron/arch/platform.
+    const nativeModules = ['better-sqlite3', 'node-pty'];
+    for (const modName of nativeModules) {
+        const modDir = path.join(tempBuildDir, 'node_modules', modName);
+        if (!fs.existsSync(modDir)) {
+            console.warn(`Skipping ${modName}: not found in node_modules after install.`);
+            continue;
+        }
+        console.log(`Fetching prebuilt binary for ${modName} (electron v${electronVersion}, darwin x64)...`);
+        try {
+            execSync(
+                `npx prebuild-install --runtime=electron --target=${electronVersion} --arch=x64 --platform=darwin --verbose`,
+                { cwd: modDir, env, stdio: 'inherit' }
+            );
+            console.log(`${modName}: prebuilt binary installed successfully.`);
+        } catch (e) {
+            console.warn(`${modName}: no prebuilt binary available, falling back to source build (node-gyp)...`);
+            try {
+                execSync(`npx node-gyp rebuild --release`, {
+                    cwd: modDir,
+                    env: {
+                        ...env,
+                        npm_config_build_from_source: 'true',
+                        CXXFLAGS: '-std=c++20 -stdlib=libc++'
+                    },
+                    stdio: 'inherit'
+                });
+            } catch (e2) {
+                console.error(`${modName}: source build also failed. This module may not work in the final app.`);
+            }
+        }
     }
 
     // Copy built modules

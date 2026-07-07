@@ -399,19 +399,152 @@ async function main() {
                     fs.writeFileSync(targetFile, content, 'utf8');
                     console.log(`Patched focusable option in ${path.basename(targetFile)} (variable was '${match[1]}').`);
 
+                    // CRITICAL: when re-packing, we MUST tell asar which
+                    // directories to keep unpacked, matching the original
+                    // archive. A plain `asar pack` with no --unpack-dir
+                    // flag marks EVERYTHING as packed -- including every
+                    // native (.node-containing) module directory, whose
+                    // real bytes we just pulled in during the extract
+                    // step (native modules are marked unpacked in asar,
+                    // so extracting the archive copies their real content
+                    // in from the sibling app.asar.unpacked folder). If we
+                    // don't re-mark them unpacked here, we seal the
+                    // ORIGINAL (pre-rebuild) native binaries directly
+                    // inside app.asar as ordinary packed files -- and
+                    // Electron will happily extract and load THAT stale
+                    // embedded copy at runtime instead of whatever we
+                    // correctly rebuild afterward in app.asar.unpacked,
+                    // since a packed native module takes priority (it's
+                    // extracted fresh to a temp file and loaded from
+                    // there, never even consulting the sibling unpacked
+                    // folder). This exact bug is what caused a persistent,
+                    // deterministic "NODE_MODULE_VERSION 143 vs 136"
+                    // crash that survived many rebuild attempts -- the
+                    // checksum of the embedded stale copy was identical
+                    // every time because this repack step recreated it
+                    // identically on every run.
+                    //
+                    // NOTE: --unpack-dir must be passed as a SEPARATE
+                    // repeated flag per directory name (`--unpack-dir "a"
+                    // --unpack-dir "b" ...`) -- a single brace-expanded
+                    // value ("{a,b,c}") is NOT accepted by this CLI's
+                    // argument parser and causes a hard "too many
+                    // arguments" error, which previously aborted the
+                    // repack entirely.
+                    let unpackDirsArg = '';
+                    let sampleNativeFileRelPath = null;
+                    try {
+                        const nodeFilesOut = execSync(
+                            `find "${path.join(patchExtractDir, 'node_modules')}" -name "*.node" -type f`,
+                            { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 }
+                        );
+                        const dirNames = new Set();
+                        for (const line of nodeFilesOut.split('\n').map(l => l.trim()).filter(Boolean)) {
+                            if (!sampleNativeFileRelPath) {
+                                sampleNativeFileRelPath = path.relative(patchExtractDir, line);
+                            }
+                            const segments = line.split(path.sep);
+                            let lastNodeModulesIdx = -1;
+                            for (let i = segments.length - 1; i >= 0; i--) {
+                                if (segments[i] === 'node_modules') { lastNodeModulesIdx = i; break; }
+                            }
+                            if (lastNodeModulesIdx === -1) continue;
+                            let nameSegCount = 1;
+                            const firstSeg = segments[lastNodeModulesIdx + 1];
+                            if (firstSeg && firstSeg.startsWith('@')) nameSegCount = 2;
+                            const nameSegs = segments.slice(lastNodeModulesIdx + 1, lastNodeModulesIdx + 1 + nameSegCount);
+                            if (nameSegs.length === 0 || nameSegs.some(s => !s)) continue;
+                            // --unpack-dir matches by bare directory NAME anywhere in the
+                            // tree, so for scoped packages we only need the final segment
+                            // (e.g. "bindings-cpp", not "@serialport/bindings-cpp").
+                            dirNames.add(nameSegs[nameSegs.length - 1]);
+                        }
+                        if (dirNames.size > 0) {
+                            // --unpack-dir takes a GLOB PATTERN matched against
+                            // the path relative to the packed root, not a bare
+                            // directory name -- "better-sqlite3" alone never
+                            // matches "node_modules/better-sqlite3". It needs a
+                            // "**/" wildcard prefix to match at any depth. This
+                            // was confirmed by dumping the actual asar header
+                            // after a "successful" (non-erroring) pack: the
+                            // entry had no `unpacked` flag at all, a real size/
+                            // offset, and the exact hash of the stale ABI-143
+                            // binary we'd been chasing -- proof the previous
+                            // bare-name pattern silently matched nothing.
+                            unpackDirsArg = Array.from(dirNames).map(n => ` --unpack-dir "**/${n}"`).join('');
+                            console.log(`Preserving unpacked status for: ${Array.from(dirNames).join(', ')}`);
+                        } else {
+                            console.warn("No native module directories detected while repacking -- if the app");
+                            console.warn("ships native modules, this may indicate a problem; proceeding without");
+                            console.warn("--unpack-dir, which risks sealing native binaries into app.asar as packed data.");
+                        }
+                    } catch (e) {
+                        console.warn("Failed to determine which directories to keep unpacked during repack:", e.message);
+                        console.warn("Proceeding without --unpack-dir -- native modules may end up incorrectly");
+                        console.warn("sealed as packed content inside app.asar.");
+                    }
+
+                    // Pack to a TEMPORARY output path first, and only replace
+                    // the real app.asar once packing has actually succeeded.
+                    // Never delete the working app.asar before confirming its
+                    // replacement exists -- doing so previously left the app
+                    // with no app.asar at all (and therefore unable to launch
+                    // whatsoever) whenever the pack command failed.
+                    const tempAsarPath = targetAsarPath + '.rebuild-tmp';
+                    if (fs.existsSync(tempAsarPath)) fs.rmSync(tempAsarPath, { force: true });
+                    execSync(`npx -y @electron/asar pack "${patchExtractDir}" "${tempAsarPath}"${unpackDirsArg}`, { stdio: 'inherit' });
+                    if (!fs.existsSync(tempAsarPath) || fs.statSync(tempAsarPath).size === 0) {
+                        throw new Error("asar pack completed without error but produced no output file -- refusing to replace the working app.asar.");
+                    }
+
+                    // VERIFY, don't just trust: confirm at least one native
+                    // module file genuinely ended up unpacked in the new
+                    // archive, rather than trusting a clean exit code alone.
+                    // A previous version of this exact --unpack-dir flag
+                    // "succeeded" (no error) while silently sealing every
+                    // native module as ordinary packed content, because the
+                    // glob pattern didn't actually match anything -- this
+                    // check catches that failure mode before it ships.
+                    if (sampleNativeFileRelPath && unpackDirsArg) {
+                        try {
+                            const verifyOut = execSync(
+                                `npx -y @electron/asar extract-file "${tempAsarPath}" "${sampleNativeFileRelPath}"`,
+                                { encoding: 'buffer', maxBuffer: 50 * 1024 * 1024 }
+                            );
+                            if (verifyOut.length > 0) {
+                                throw new Error(
+                                    `Native module file "${sampleNativeFileRelPath}" was sealed into app.asar as ` +
+                                    `packed content (${verifyOut.length} bytes) instead of staying unpacked -- ` +
+                                    `the --unpack-dir pattern did not match. Refusing to ship a build that would ` +
+                                    `load a stale native module at runtime.`
+                                );
+                            }
+                            console.log(`Verified ${sampleNativeFileRelPath} is genuinely unpacked in the new archive.`);
+                        } catch (verifyErr) {
+                            fs.rmSync(tempAsarPath, { force: true });
+                            throw verifyErr;
+                        }
+                    }
+
                     fs.rmSync(targetAsarPath, { force: true });
-                    execSync(`npx -y @electron/asar pack "${patchExtractDir}" "${targetAsarPath}"`, { stdio: 'inherit' });
+                    fs.renameSync(tempAsarPath, targetAsarPath);
                     console.log("Repacked app.asar with focusable patch applied.");
                 }
             }
         } catch (e) {
             console.warn("Failed to apply focusable-window patch:", e.message);
-            console.warn("The app should still build, but on the Electron 37.5.1 macOS-11 fallback the primary");
-            console.warn("window may not accept keyboard focus (grey traffic lights, no typing). See session");
-            console.warn("notes for the manual extract/patch/repack steps as a fallback.");
+            console.warn("The original app.asar was left untouched (this step no longer deletes it until a");
+            console.warn("replacement is confirmed to exist), so the app should still build and launch --");
+            console.warn("but on the Electron 37.5.1 macOS-11 fallback the primary window may not accept");
+            console.warn("keyboard focus (grey traffic lights, no typing). See session notes for the manual");
+            console.warn("extract/patch/repack steps as a fallback.");
         } finally {
             if (fs.existsSync(patchExtractDir)) {
                 fs.rmSync(patchExtractDir, { recursive: true, force: true });
+            }
+            const leftoverTemp = path.join(targetResources, 'app.asar.rebuild-tmp');
+            if (fs.existsSync(leftoverTemp)) {
+                fs.rmSync(leftoverTemp, { force: true });
             }
         }
     }
@@ -428,82 +561,97 @@ async function main() {
     // one needs rebuilding for whichever Electron version we actually
     // bundle. Leaving any of them un-rebuilt causes a NODE_MODULE_VERSION
     // mismatch at runtime -- this is exactly what caused a "Codex cannot
-    // access its local database" dialog during development, even though
-    // the actual failing module (node-mac-permissions) had nothing to do
-    // with the database; the app's generic startup error handling just
-    // misattributed the crash. Scanning for every native module rather
-    // than hardcoding a list also means this keeps working automatically
-    // if OpenAI adds or removes native dependencies in a future release.
+    // access its local database" dialog during development; the actual
+    // failing module was unrelated to the database, but the app's
+    // generic startup error handling misattributed the crash.
+    //
+    // NOTE ON DETECTION STRATEGY: OpenAI's build strips package.json out
+    // of every unpacked native module folder entirely (confirmed via
+    // direct inspection -- `ls` on node-pty/better-sqlite3's unpacked
+    // folders shows only build/lib/node_modules, no package.json at
+    // all). That rules out reading each package's own manifest for its
+    // name, so instead we identify package roots purely from the
+    // node_modules PATH STRUCTURE itself (the nearest/deepest
+    // "node_modules/<name>" or "node_modules/@scope/name" ancestor of
+    // each .node file) -- this is the same convention Node's own module
+    // resolution relies on, so it works regardless of nesting depth
+    // without needing any manifest to be present. For the VERSION of
+    // each discovered package, we prefer whatever the main app's own
+    // top-level package.json declares (pkg.dependencies /
+    // pkg.optionalDependencies) -- this is how the original hardcoded
+    // better-sqlite3/node-pty logic worked all along, which is why it
+    // never hit this problem. For packages that aren't direct
+    // dependencies of the app itself (deeply-nested transitive native
+    // deps like node-hid/serialport under @worklouder/...), there's no
+    // authoritative version available at all once package.json is
+    // stripped, so we fall back to letting npm install the latest
+    // published version -- a reasonable best-effort for what are
+    // peripheral device-support addons, logged clearly so it's visible
+    // if that ever turns out to matter.
     console.log("Scanning app.asar.unpacked for native (.node) packages to rebuild...");
 
     function findNativePackageDirs(rootDir) {
         const nodeModulesRoot = path.join(rootDir, 'node_modules');
-        console.log(`[native-scan] rootDir=${rootDir}`);
-        console.log(`[native-scan] nodeModulesRoot=${nodeModulesRoot}`);
-        console.log(`[native-scan] nodeModulesRoot exists=${fs.existsSync(nodeModulesRoot)}`);
         if (!fs.existsSync(nodeModulesRoot)) return [];
         const findCmd = `find "${nodeModulesRoot}" -name "*.node" -type f`;
-        console.log(`[native-scan] running: ${findCmd}`);
         let nodeFilesOutput;
         try {
             nodeFilesOutput = execSync(findCmd, { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
         } catch (e) {
-            console.warn("[native-scan] find command threw an error:", e.message);
-            if (e.stdout) console.warn("[native-scan] partial stdout was:", e.stdout.toString().slice(0, 2000));
-            if (e.stderr) console.warn("[native-scan] stderr was:", e.stderr.toString().slice(0, 2000));
+            console.warn("[native-scan] find command failed:", e.message);
             return [];
         }
-        console.log(`[native-scan] raw output length=${nodeFilesOutput.length}`);
-        console.log(`[native-scan] raw output (first 2000 chars):\n${nodeFilesOutput.slice(0, 2000)}`);
         const nodeFiles = nodeFilesOutput.split('\n').map(l => l.trim()).filter(Boolean);
-        console.log(`[native-scan] parsed ${nodeFiles.length} .node file path(s)`);
-        const packageRoots = new Set();
+
+        // Map from absolute package-root-dir -> {relPath, name}
+        const packageMap = new Map();
         for (const nodeFile of nodeFiles) {
-            let dir = path.dirname(nodeFile);
-            let found = false;
-            while (dir.startsWith(rootDir)) {
-                if (fs.existsSync(path.join(dir, 'package.json'))) {
-                    packageRoots.add(dir);
-                    found = true;
-                    break;
-                }
-                const parent = path.dirname(dir);
-                if (parent === dir) break;
-                dir = parent;
+            const segments = nodeFile.split(path.sep);
+            let lastNodeModulesIdx = -1;
+            for (let i = segments.length - 1; i >= 0; i--) {
+                if (segments[i] === 'node_modules') { lastNodeModulesIdx = i; break; }
             }
-            if (!found) {
-                console.warn(`[native-scan] could not find a package.json above: ${nodeFile}`);
+            if (lastNodeModulesIdx === -1) {
+                console.warn(`[native-scan] no node_modules ancestor found for: ${nodeFile}`);
+                continue;
             }
+            let nameSegCount = 1;
+            const firstSeg = segments[lastNodeModulesIdx + 1];
+            if (firstSeg && firstSeg.startsWith('@')) nameSegCount = 2;
+            const nameSegs = segments.slice(lastNodeModulesIdx + 1, lastNodeModulesIdx + 1 + nameSegCount);
+            if (nameSegs.length === 0 || nameSegs.some(s => !s)) {
+                console.warn(`[native-scan] couldn't parse package name for: ${nodeFile}`);
+                continue;
+            }
+            const rootDirPath = segments.slice(0, lastNodeModulesIdx + 1 + nameSegCount).join(path.sep);
+            const name = nameSegs.join('/');
+            packageMap.set(rootDirPath, {
+                dir: rootDirPath,
+                relPath: path.relative(nodeModulesRoot, rootDirPath),
+                name,
+            });
         }
-        console.log(`[native-scan] identified ${packageRoots.size} unique package root(s)`);
-        const results = [];
-        for (const dir of packageRoots) {
-            try {
-                const ownPkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
-                if (!ownPkg.name || !ownPkg.version) {
-                    console.warn(`Skipping ${dir}: package.json missing name/version.`);
-                    continue;
-                }
-                results.push({
-                    dir,
-                    relPath: path.relative(nodeModulesRoot, dir),
-                    name: ownPkg.name,
-                    version: ownPkg.version,
-                });
-            } catch (e) {
-                console.warn(`Found native binary under a package at ${dir} but couldn't read its package.json:`, e.message);
-            }
-        }
-        return results;
+        return Array.from(packageMap.values());
     }
 
-    const nativePackages = findNativePackageDirs(targetUnpacked);
+    const discoveredPackages = findNativePackageDirs(targetUnpacked);
+
+    // Resolve a version for each discovered package: prefer the app's own
+    // declared dependency version; otherwise fall back to "latest".
+    const declaredDeps = { ...(pkg.dependencies || {}), ...(pkg.optionalDependencies || {}) };
+    const nativePackages = discoveredPackages.map(p => {
+        if (declaredDeps[p.name]) {
+            return { ...p, version: declaredDeps[p.name], versionSource: 'app package.json' };
+        }
+        return { ...p, version: 'latest', versionSource: 'no declared version found -- using latest' };
+    });
+
     if (nativePackages.length === 0) {
         console.warn("No native packages found under app.asar.unpacked -- this is unexpected, double-check the app still ships native modules.");
     } else {
         console.log(`Found ${nativePackages.length} native package(s) to rebuild for Electron ${electronVersion}:`);
         for (const p of nativePackages) {
-            console.log(`  - ${p.name}@${p.version} (at node_modules/${p.relPath})`);
+            console.log(`  - ${p.name}@${p.version} (at node_modules/${p.relPath}) [${p.versionSource}]`);
         }
     }
 

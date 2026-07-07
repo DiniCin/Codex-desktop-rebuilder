@@ -8,7 +8,7 @@ const REPO_ROOT = __dirname;
 const MOUNT_POINT = '/Volumes/CodexMount';
 const DMG_PATH = path.join(REPO_ROOT, 'Codex.dmg');
 const TEMP_DIR = path.join(REPO_ROOT, 'temp_build');
-const FINAL_APP_PATH = path.join(REPO_ROOT, 'Codex_Intel.app');
+const FINAL_APP_PATH = path.join(REPO_ROOT, 'Codex_Intel_os11.app');
 const RESOURCES_DIR = path.join(REPO_ROOT, 'resources');
 // detect CODEX_CLI_PATH dynamically
 let CODEX_CLI_PATH = '/usr/local/lib/node_modules/@openai/codex';
@@ -895,7 +895,7 @@ exec "$DIR/Codex.orig" --no-sandbox "$@"
         fs.unlinkSync(extractedPkgJson);
     }
 
-    console.log("Done! Codex_Intel.app is ready at " + targetApp);
+    console.log("Done! Codex_Intel_os11.app is ready at " + targetApp);
 }
 
 main().catch(err => {

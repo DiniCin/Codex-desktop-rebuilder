@@ -294,8 +294,218 @@ async function main() {
         fs.mkdirSync(targetUnpacked, { recursive: true });
     }
 
+    // 6.5. Patch "focusable" default-value regression for downgraded Electron
+    // ------------------------------------------------------------------
+    // When the Codex app's main-process bundle creates most of its windows
+    // (primary, secondary, hud, hotkey-window home/thread, etc.) via the
+    // shared BrowserWindow-construction code, it forwards a `focusable`
+    // option that is `undefined` whenever the caller didn't explicitly
+    // request non-focusable (which is the normal case for the primary
+    // window). On stock/newer Electron, an explicitly-present-but-undefined
+    // `focusable` key falls back to Electron's documented default of
+    // `true`. On Electron 37.5.1 -- the version we fall back to for
+    // macOS < 12 compatibility -- this instead resolves to `false`,
+    // silently creating an unfocusable primary window: grey traffic
+    // lights, an AXDialog accessibility subrole instead of the normal
+    // AXStandardWindow, and no keyboard input ever reaching the renderer,
+    // with no error logged anywhere.
+    //
+    // We patch the built main-process bundle to coalesce that value to
+    // `true` (`focusable:X??!0`) before it reaches the BrowserWindow
+    // constructor. This is a no-op wherever the bug doesn't apply, so we
+    // always run this patch regardless of which Electron version ended up
+    // bundled -- it's cheap insurance.
+    //
+    // CRITICAL ORDERING NOTE: this step MUST run here -- right after the
+    // pristine app.asar.unpacked tree is copied in from the DMG, and
+    // BEFORE the native-module rebuild below overwrites better-sqlite3/
+    // node-pty with freshly-built versions. Patching app.asar requires a
+    // full extract-and-repack round trip, and `asar extract` doesn't just
+    // read bytes out of the .asar file -- for anything the archive marks
+    // "unpacked" it goes looking for the real file in the sibling
+    // app.asar.unpacked folder on disk. If the native-module rebuild has
+    // already run by this point, our freshly-built better-sqlite3/
+    // node-pty trees won't perfectly match every file OpenAI's original
+    // build shipped there (missing .bin symlinks, missing transient gyp
+    // build-stamp files, etc.), and `asar extract` fails outright with
+    // ENOENT hunting for files that simply don't exist in our rebuilt
+    // tree. Running this step while app.asar.unpacked is still the
+    // untouched, complete, DMG-sourced original avoids that entirely --
+    // and it's safe to do so, because this step never touches
+    // app.asar.unpacked itself, only app.asar. Do not move this block
+    // below the "Rebuilding native modules" section.
+    //
+    // The bundle filename is a content hash that changes with every
+    // OpenAI release (e.g. main-z6HVz-xR.js), so rather than hardcoding
+    // it, we locate the right file inside .vite/build by searching for a
+    // structural anchor string that sits immediately after the
+    // `focusable` option in the shared window-creation code. If OpenAI
+    // changes that surrounding code enough that the anchor no longer
+    // matches, this step logs a warning and skips itself rather than
+    // failing the whole build -- if you hit that warning on a future
+    // version, the fix is to update ANCHOR/focusablePattern below to
+    // match the new minified structure (re-run the diagnostic steps from
+    // the session that found this bug: add a temporary console.log next
+    // to any `focusable:` option in the extracted bundle and watch
+    // isFocusable() in the app's focus-changed handler).
+    console.log("Patching main-process bundle for focusable-window regression...");
+    {
+        const patchExtractDir = path.join(TEMP_DIR, 'asar_patch_extract');
+        if (fs.existsSync(patchExtractDir)) {
+            fs.rmSync(patchExtractDir, { recursive: true, force: true });
+        }
+        const targetAsarPath = path.join(targetResources, 'app.asar');
+
+        try {
+            execSync(`npx -y @electron/asar extract "${targetAsarPath}" "${patchExtractDir}"`, { stdio: 'inherit' });
+
+            const ANCHOR = 'autoHideMenuBar:!0';
+            const buildDir = path.join(patchExtractDir, '.vite', 'build');
+            let targetFile = null;
+
+            if (fs.existsSync(buildDir)) {
+                const candidates = fs.readdirSync(buildDir).filter(f => f.endsWith('.js'));
+                for (const f of candidates) {
+                    const full = path.join(buildDir, f);
+                    const content = fs.readFileSync(full, 'utf8');
+                    if (content.includes(ANCHOR)) {
+                        targetFile = full;
+                        break;
+                    }
+                }
+            }
+
+            if (!targetFile) {
+                console.warn("Could not locate main-process bundle to patch (no file under .vite/build contained");
+                console.warn("the expected anchor string). Skipping focusable-window patch.");
+                console.warn("If windows don't accept keyboard input after rebuilding, this bundle's structure");
+                console.warn("has likely changed in a newer Codex release and the patch in rebuild_codex.js");
+                console.warn("needs to be updated to match it -- see the comment above this block.");
+            } else {
+                let content = fs.readFileSync(targetFile, 'utf8');
+                // Matches: focusable:<identifier>,...process.platform===`win32`||process.platform===`linux`?{autoHideMenuBar:!0}:{}
+                // The identifier is whatever the minifier named the destructured
+                // `focusable` parameter (e.g. `m`) -- captured generically so
+                // renamed variables in future builds still match.
+                const focusablePattern = /focusable:([a-zA-Z_$][\w$]*),(\.\.\.process\.platform===`win32`\|\|process\.platform===`linux`\?\{autoHideMenuBar:!0\}:\{\})/;
+                const match = content.match(focusablePattern);
+
+                if (!match) {
+                    console.warn(`Found candidate bundle (${path.basename(targetFile)}) but the focusable-option`);
+                    console.warn("pattern didn't match inside it. Skipping patch -- the minified structure has");
+                    console.warn("likely shifted since this script was written; update focusablePattern above.");
+                } else {
+                    content = content.replace(focusablePattern, 'focusable:$1??!0,$2');
+                    fs.writeFileSync(targetFile, content, 'utf8');
+                    console.log(`Patched focusable option in ${path.basename(targetFile)} (variable was '${match[1]}').`);
+
+                    fs.rmSync(targetAsarPath, { force: true });
+                    execSync(`npx -y @electron/asar pack "${patchExtractDir}" "${targetAsarPath}"`, { stdio: 'inherit' });
+                    console.log("Repacked app.asar with focusable patch applied.");
+                }
+            }
+        } catch (e) {
+            console.warn("Failed to apply focusable-window patch:", e.message);
+            console.warn("The app should still build, but on the Electron 37.5.1 macOS-11 fallback the primary");
+            console.warn("window may not accept keyboard focus (grey traffic lights, no typing). See session");
+            console.warn("notes for the manual extract/patch/repack steps as a fallback.");
+        } finally {
+            if (fs.existsSync(patchExtractDir)) {
+                fs.rmSync(patchExtractDir, { recursive: true, force: true });
+            }
+        }
+    }
+
     // Fix Rebuild needed modules
-    console.log("Rebuilding native modules (better-sqlite3, node-pty) for Electron x64...");
+    // ------------------------------------------------------------------
+    // IMPORTANT: this rebuilds EVERY native (.node-containing) package
+    // found anywhere under app.asar.unpacked, not just better-sqlite3/
+    // node-pty. OpenAI's dependency tree ships several other native
+    // addons (e.g. node-mac-permissions, objc-js, and transitively
+    // nested modules like node-hid/serialport under scoped packages
+    // such as @worklouder/...) -- every single one of them was compiled
+    // for the ORIGINAL Electron version this app shipped with, and every
+    // one needs rebuilding for whichever Electron version we actually
+    // bundle. Leaving any of them un-rebuilt causes a NODE_MODULE_VERSION
+    // mismatch at runtime -- this is exactly what caused a "Codex cannot
+    // access its local database" dialog during development, even though
+    // the actual failing module (node-mac-permissions) had nothing to do
+    // with the database; the app's generic startup error handling just
+    // misattributed the crash. Scanning for every native module rather
+    // than hardcoding a list also means this keeps working automatically
+    // if OpenAI adds or removes native dependencies in a future release.
+    console.log("Scanning app.asar.unpacked for native (.node) packages to rebuild...");
+
+    function findNativePackageDirs(rootDir) {
+        const nodeModulesRoot = path.join(rootDir, 'node_modules');
+        console.log(`[native-scan] rootDir=${rootDir}`);
+        console.log(`[native-scan] nodeModulesRoot=${nodeModulesRoot}`);
+        console.log(`[native-scan] nodeModulesRoot exists=${fs.existsSync(nodeModulesRoot)}`);
+        if (!fs.existsSync(nodeModulesRoot)) return [];
+        const findCmd = `find "${nodeModulesRoot}" -name "*.node" -type f`;
+        console.log(`[native-scan] running: ${findCmd}`);
+        let nodeFilesOutput;
+        try {
+            nodeFilesOutput = execSync(findCmd, { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+        } catch (e) {
+            console.warn("[native-scan] find command threw an error:", e.message);
+            if (e.stdout) console.warn("[native-scan] partial stdout was:", e.stdout.toString().slice(0, 2000));
+            if (e.stderr) console.warn("[native-scan] stderr was:", e.stderr.toString().slice(0, 2000));
+            return [];
+        }
+        console.log(`[native-scan] raw output length=${nodeFilesOutput.length}`);
+        console.log(`[native-scan] raw output (first 2000 chars):\n${nodeFilesOutput.slice(0, 2000)}`);
+        const nodeFiles = nodeFilesOutput.split('\n').map(l => l.trim()).filter(Boolean);
+        console.log(`[native-scan] parsed ${nodeFiles.length} .node file path(s)`);
+        const packageRoots = new Set();
+        for (const nodeFile of nodeFiles) {
+            let dir = path.dirname(nodeFile);
+            let found = false;
+            while (dir.startsWith(rootDir)) {
+                if (fs.existsSync(path.join(dir, 'package.json'))) {
+                    packageRoots.add(dir);
+                    found = true;
+                    break;
+                }
+                const parent = path.dirname(dir);
+                if (parent === dir) break;
+                dir = parent;
+            }
+            if (!found) {
+                console.warn(`[native-scan] could not find a package.json above: ${nodeFile}`);
+            }
+        }
+        console.log(`[native-scan] identified ${packageRoots.size} unique package root(s)`);
+        const results = [];
+        for (const dir of packageRoots) {
+            try {
+                const ownPkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
+                if (!ownPkg.name || !ownPkg.version) {
+                    console.warn(`Skipping ${dir}: package.json missing name/version.`);
+                    continue;
+                }
+                results.push({
+                    dir,
+                    relPath: path.relative(nodeModulesRoot, dir),
+                    name: ownPkg.name,
+                    version: ownPkg.version,
+                });
+            } catch (e) {
+                console.warn(`Found native binary under a package at ${dir} but couldn't read its package.json:`, e.message);
+            }
+        }
+        return results;
+    }
+
+    const nativePackages = findNativePackageDirs(targetUnpacked);
+    if (nativePackages.length === 0) {
+        console.warn("No native packages found under app.asar.unpacked -- this is unexpected, double-check the app still ships native modules.");
+    } else {
+        console.log(`Found ${nativePackages.length} native package(s) to rebuild for Electron ${electronVersion}:`);
+        for (const p of nativePackages) {
+            console.log(`  - ${p.name}@${p.version} (at node_modules/${p.relPath})`);
+        }
+    }
 
     const tempBuildDir = path.join(REPO_ROOT, 'native_build_temp');
     if (fs.existsSync(tempBuildDir)) {
@@ -305,11 +515,11 @@ async function main() {
 
     const nativePkg = {
         "name": "temp-build",
-        "dependencies": {
-            "better-sqlite3": pkg.dependencies['better-sqlite3'],
-            "node-pty": pkg.dependencies['node-pty']
-        }
+        "dependencies": {}
     };
+    for (const p of nativePackages) {
+        nativePkg.dependencies[p.name] = p.version;
+    }
     fs.writeFileSync(path.join(tempBuildDir, 'package.json'), JSON.stringify(nativePkg, null, 2));
 
     const env = {
@@ -330,22 +540,21 @@ async function main() {
 
     // Try prebuilt binaries first for each native module; only fall back to
     // node-gyp (source compile) if no prebuild exists for this Electron/arch/platform.
-    const nativeModules = ['better-sqlite3', 'node-pty'];
-    for (const modName of nativeModules) {
-        const modDir = path.join(tempBuildDir, 'node_modules', modName);
+    for (const p of nativePackages) {
+        const modDir = path.join(tempBuildDir, 'node_modules', p.name);
         if (!fs.existsSync(modDir)) {
-            console.warn(`Skipping ${modName}: not found in node_modules after install.`);
+            console.warn(`Skipping ${p.name}: not found in node_modules after install (fresh install of this exact name@version may have failed or resolved differently than expected).`);
             continue;
         }
-        console.log(`Fetching prebuilt binary for ${modName} (electron v${electronVersion}, darwin x64)...`);
+        console.log(`Fetching prebuilt binary for ${p.name} (electron v${electronVersion}, darwin x64)...`);
         try {
             execSync(
                 `npx prebuild-install --runtime=electron --target=${electronVersion} --arch=x64 --platform=darwin --verbose`,
                 { cwd: modDir, env, stdio: 'inherit' }
             );
-            console.log(`${modName}: prebuilt binary installed successfully.`);
+            console.log(`${p.name}: prebuilt binary installed successfully.`);
         } catch (e) {
-            console.warn(`${modName}: no prebuilt binary available, falling back to source build (node-gyp)...`);
+            console.warn(`${p.name}: no prebuilt binary available, falling back to source build (node-gyp)...`);
             try {
                 execSync(`npx node-gyp rebuild --release`, {
                     cwd: modDir,
@@ -357,33 +566,31 @@ async function main() {
                     stdio: 'inherit'
                 });
             } catch (e2) {
-                console.error(`${modName}: source build also failed. This module may not work in the final app.`);
+                console.error(`${p.name}: source build also failed. This module may not work in the final app.`);
             }
         }
     }
 
-    // Copy built modules
-    const bs3Src = path.join(tempBuildDir, 'node_modules/better-sqlite3');
-    const bs3Dest = path.join(targetUnpacked, 'node_modules/better-sqlite3');
-    if (fs.existsSync(bs3Dest)) {
-        fs.rmSync(bs3Dest, { recursive: true, force: true });
-    }
-    // Check if source exists
-    if (fs.existsSync(bs3Src)) {
-        run(`cp -r "${bs3Src}" "${bs3Dest}"`);
-    }
-
-    const ptySrc = path.join(tempBuildDir, 'node_modules/node-pty');
-    const ptyDest = path.join(targetUnpacked, 'node_modules/node-pty');
-    if (fs.existsSync(ptyDest)) {
-        fs.rmSync(ptyDest, { recursive: true, force: true });
-    }
-    if (fs.existsSync(ptySrc)) {
-        run(`cp -r "${ptySrc}" "${ptyDest}"`);
+    // Copy each freshly-rebuilt module back into its EXACT original
+    // location inside app.asar.unpacked (which may be deeply nested,
+    // e.g. node_modules/@worklouder/device-kit-oai/node_modules/
+    // @worklouder/wl-device-kit/node_modules/node-hid) -- not just a
+    // shallow top-level node_modules/<name> path.
+    for (const p of nativePackages) {
+        const freshSrc = path.join(tempBuildDir, 'node_modules', p.name);
+        const originalDest = path.join(targetUnpacked, 'node_modules', p.relPath);
+        if (!fs.existsSync(freshSrc)) {
+            console.warn(`Skipping copy-back for ${p.name}: no freshly-built module found (see warnings above).`);
+            continue;
+        }
+        if (fs.existsSync(originalDest)) {
+            fs.rmSync(originalDest, { recursive: true, force: true });
+        }
+        fs.mkdirSync(path.dirname(originalDest), { recursive: true });
+        run(`cp -r "${freshSrc}" "${originalDest}"`);
     }
 
     console.log("Native modules updated.");
-
     // Config Info.plist and Executable
     console.log("Configuring Info.plist and Executable...");
 
